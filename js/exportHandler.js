@@ -1,0 +1,279 @@
+// Export Handler — Export newsletter as PNG/JPG or print
+
+/**
+ * Pre-process images: html2canvas does NOT support object-fit properly,
+ * so we temporarily replace each <img> with an inline canvas that
+ * has the correct cropping baked in, then restore after capture.
+ */
+async function prepareImagesForExport(container) {
+  const images = container.querySelectorAll('.nl-photo-item img, .nl-logo img');
+  const restoreFns = [];
+
+  for (const img of images) {
+    if (!img.naturalWidth) continue;
+
+    const rect = img.getBoundingClientRect();
+    const cw = rect.width;
+    const ch = rect.height;
+    const nw = img.naturalWidth;
+    const nh = img.naturalHeight;
+
+    // Calculate object-fit: cover crop
+    const containerRatio = cw / ch;
+    const imageRatio = nw / nh;
+    let sx, sy, sw, sh;
+
+    if (imageRatio > containerRatio) {
+      // Image is wider → crop sides
+      sh = nh;
+      sw = nh * containerRatio;
+      sx = (nw - sw) / 2;
+      sy = 0;
+    } else {
+      // Image is taller → crop top/bottom
+      sw = nw;
+      sh = nw / containerRatio;
+      sx = 0;
+      sy = (nh - sh) / 2;
+    }
+
+    // Draw cropped version onto a canvas element
+    const canvas = document.createElement('canvas');
+    canvas.width = cw * 2;  // 2x for high-res export
+    canvas.height = ch * 2;
+    canvas.style.width = cw + 'px';
+    canvas.style.height = ch + 'px';
+    canvas.style.display = 'block';
+    canvas.style.borderRadius = getComputedStyle(img).borderRadius;
+
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+
+    // Swap img → canvas
+    const parent = img.parentNode;
+    parent.replaceChild(canvas, img);
+
+    restoreFns.push(() => parent.replaceChild(img, canvas));
+  }
+
+  return () => restoreFns.forEach(fn => fn());
+}
+
+export async function exportAsImage(format = 'png') {
+  const page = document.getElementById('nl-page');
+  if (!page) return;
+
+  showLoading('กำลังส่งออก...');
+  let restoreImages = null;
+  let originalBg = '';
+  const isCustomBg = page.classList.contains('has-bg');
+
+  try {
+    if (isCustomBg) {
+      originalBg = page.style.backgroundImage;
+      page.style.backgroundImage = 'none'; // hide it from html2canvas
+    }
+
+    // Pre-process images to preserve aspect ratios
+    restoreImages = await prepareImagesForExport(page);
+
+    // Dynamically import html2canvas
+    const { default: html2canvas } = await import('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/+esm');
+
+    const contentCanvas = await html2canvas(page, {
+      scale: 3, // Ultra-high resolution (3x)
+      useCORS: true,
+      allowTaint: true,
+      backgroundColor: isCustomBg ? null : '#ffffff',
+      width: page.scrollWidth,
+      height: page.scrollHeight,
+      logging: false,
+    });
+
+    let finalCanvas = contentCanvas;
+
+    if (isCustomBg && originalBg) {
+      // Extract URL from 'url("...")'
+      const urlMatch = originalBg.match(/url\(['"]?(.*?)['"]?\)/);
+      if (urlMatch && urlMatch[1]) {
+        const bgUrl = urlMatch[1];
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.src = bgUrl;
+        
+        try {
+          await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = reject;
+          });
+
+          finalCanvas = document.createElement('canvas');
+          finalCanvas.width = contentCanvas.width;
+          finalCanvas.height = contentCanvas.height;
+          const ctx = finalCanvas.getContext('2d');
+
+          // Draw background (cover)
+          const imgRatio = img.naturalWidth / img.naturalHeight;
+          const canvasRatio = finalCanvas.width / finalCanvas.height;
+          let sx, sy, sw, sh;
+          if (imgRatio > canvasRatio) {
+            sh = img.naturalHeight;
+            sw = img.naturalHeight * canvasRatio;
+            sx = (img.naturalWidth - sw) / 2;
+            sy = 0;
+          } else {
+            sw = img.naturalWidth;
+            sh = img.naturalWidth / canvasRatio;
+            sx = 0;
+            sy = (img.naturalHeight - sh) / 2;
+          }
+          
+          // Use high quality image smoothing
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          ctx.drawImage(img, sx, sy, sw, sh, 0, 0, finalCanvas.width, finalCanvas.height);
+          
+          // Draw content on top
+          ctx.drawImage(contentCanvas, 0, 0);
+        } catch (imgErr) {
+          console.error("Failed to load background for export", imgErr);
+        }
+      }
+    }
+
+    const mimeType = format === 'png' ? 'image/png' : 'image/jpeg';
+    const quality = format === 'png' ? 1 : 0.92;
+    const dataUrl = finalCanvas.toDataURL(mimeType, quality);
+
+    // Download
+    const link = document.createElement('a');
+    link.download = `วารสาร_${new Date().toISOString().slice(0, 10)}.${format}`;
+    link.href = dataUrl;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    showToast('ส่งออกสำเร็จ!', 'success');
+  } catch (err) {
+    console.error('Export error:', err);
+    showToast('เกิดข้อผิดพลาดในการส่งออก', 'error');
+  } finally {
+    if (restoreImages) restoreImages();
+    if (isCustomBg) {
+      page.style.backgroundImage = originalBg;
+    }
+    hideLoading();
+  }
+}
+
+export function printNewsletter() {
+  const page = document.getElementById('nl-page');
+  if (!page) return;
+
+  const printWindow = window.open('', '_blank');
+  const styles = Array.from(document.querySelectorAll('link[rel="stylesheet"], style'))
+    .map(el => el.outerHTML)
+    .join('\n');
+
+  printWindow.document.write(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <title>พิมพ์วารสาร</title>
+      ${styles}
+      <style>
+        body { margin: 0; padding: 0; background: white; }
+        .nl-page { box-shadow: none !important; margin: 0 auto; }
+        @media print {
+          .nl-page { width: 100% !important; min-height: auto !important; }
+        }
+      </style>
+    </head>
+    <body>${page.outerHTML}</body>
+    </html>
+  `);
+
+  printWindow.document.close();
+  setTimeout(() => {
+    printWindow.print();
+    printWindow.close();
+  }, 500);
+}
+
+let isInitialized = false;
+
+export function initExport() {
+  if (isInitialized) return;
+
+  const exportBtn = document.getElementById('btn-export');
+  const modal = document.getElementById('export-modal');
+  const closeBtn = document.getElementById('export-modal-close');
+  const pngBtn = document.getElementById('export-png');
+  const jpgBtn = document.getElementById('export-jpg');
+  const printBtn = document.getElementById('export-print');
+
+  if (exportBtn) {
+    exportBtn.addEventListener('click', () => {
+      if (modal) modal.style.display = 'flex';
+    });
+  }
+
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => {
+      if (modal) modal.style.display = 'none';
+    });
+  }
+
+  // Close on overlay click
+  if (modal) {
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) modal.style.display = 'none';
+    });
+  }
+
+  if (pngBtn) {
+    pngBtn.addEventListener('click', () => {
+      if (modal) modal.style.display = 'none';
+      exportAsImage('png');
+    });
+  }
+
+  if (jpgBtn) {
+    jpgBtn.addEventListener('click', () => {
+      if (modal) modal.style.display = 'none';
+      exportAsImage('jpg');
+    });
+  }
+
+  if (printBtn) {
+    printBtn.addEventListener('click', () => {
+      if (modal) modal.style.display = 'none';
+      printNewsletter();
+    });
+  }
+  
+  isInitialized = true;
+}
+
+function showLoading(text) {
+  const overlay = document.getElementById('loading-overlay');
+  const loadingText = document.getElementById('loading-text');
+  if (overlay) overlay.style.display = 'flex';
+  if (loadingText) loadingText.textContent = text;
+}
+
+function hideLoading() {
+  const overlay = document.getElementById('loading-overlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+function showToast(message, type = 'info') {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.textContent = message;
+  container.appendChild(toast);
+  setTimeout(() => toast.remove(), 3000);
+}
