@@ -169,6 +169,9 @@ export async function exportAsImage(format = 'png') {
     // Replace any remaining <img> src with same-origin blob URLs
     restoreImgSrcs = await replaceImgSrcsWithBlobs(page);
 
+    // Ensure all custom fonts (e.g. Google Fonts) are fully loaded and applied
+    await document.fonts.ready;
+
     // Dynamically import html2canvas
     const { default: html2canvas } = await import('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/+esm');
 
@@ -180,6 +183,13 @@ export async function exportAsImage(format = 'png') {
       width: page.scrollWidth,
       height: page.scrollHeight,
       logging: false,
+      onclone: (clonedDoc) => {
+        // Explicitly force web fonts in cloned document
+        const link = clonedDoc.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = 'https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600;700;800&family=Sarabun:wght@300;400;500;600;700&display=swap';
+        clonedDoc.head.appendChild(link);
+      }
     });
 
     let finalCanvas = contentCanvas;
