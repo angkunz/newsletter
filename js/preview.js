@@ -167,7 +167,7 @@ function updateLogo(side, url) {
   const el = document.getElementById(`nl-logo-${side}`);
   if (!el) return;
   if (url) {
-    el.innerHTML = `<img src="${url}" alt="โลโก้${side === 'left' ? 'ซ้าย' : 'ขวา'}" />`;
+    el.innerHTML = `<img src="${url}" alt="โลโก้${side === 'left' ? 'ซ้าย' : 'ขวา'}" crossorigin="anonymous" />`;
   } else {
     el.innerHTML = '';
   }
@@ -196,7 +196,7 @@ function updatePhotoGrid(photos, layout = 'standard') {
   grid.className = `nl-photo-grid has-photos layout-${layout} grid-${count}`;
   grid.innerHTML = photos.map((url, i) => `
     <div class="nl-photo-item">
-      <img src="${url}" alt="รูปที่ ${i + 1}" loading="lazy" />
+      <img src="${url}" alt="รูปที่ ${i + 1}" loading="lazy" crossorigin="anonymous" />
     </div>
   `).join('');
 }

@@ -1,6 +1,54 @@
 // Export Handler — Export newsletter as PNG/JPG or print
 
 /**
+ * Fetch an image URL as a blob and return a same-origin object URL.
+ * Object URLs are always same-origin, so drawing them on a canvas
+ * will never taint it — completely bypassing CORS canvas restrictions.
+ */
+async function fetchAsObjectUrl(src) {
+  try {
+    const response = await fetch(src);
+    if (!response.ok) throw new Error('Fetch failed');
+    const blob = await response.blob();
+    return URL.createObjectURL(blob);
+  } catch (err) {
+    // If direct fetch fails (e.g. CORS), fallback to a public CORS proxy
+    const proxyUrl = `https://corsproxy.io/?url=${encodeURIComponent(src)}`;
+    try {
+      const proxyRes = await fetch(proxyUrl);
+      if (!proxyRes.ok) throw new Error('Proxy fetch failed');
+      const proxyBlob = await proxyRes.blob();
+      return URL.createObjectURL(proxyBlob);
+    } catch (proxyErr) {
+      // Fallback 2 if corsproxy.io fails
+      const proxy2Url = `https://api.allorigins.win/raw?url=${encodeURIComponent(src)}`;
+      const proxy2Res = await fetch(proxy2Url);
+      const proxy2Blob = await proxy2Res.blob();
+      return URL.createObjectURL(proxy2Blob);
+    }
+  }
+}
+
+/**
+ * Load an image from a URL via blob fetch (same-origin safe).
+ * Returns { img, objectUrl } or null on failure.
+ */
+async function loadCleanImage(src) {
+  try {
+    const objectUrl = await fetchAsObjectUrl(src);
+    const img = new Image();
+    img.src = objectUrl;
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = reject;
+    });
+    return { img, objectUrl };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Pre-process images: html2canvas does NOT support object-fit properly,
  * so we temporarily replace each <img> with an inline canvas that
  * has the correct cropping baked in, then restore after capture.
@@ -8,6 +56,7 @@
 async function prepareImagesForExport(container) {
   const images = container.querySelectorAll('.nl-photo-item img, .nl-logo img');
   const restoreFns = [];
+  const objectUrls = []; // track for cleanup
 
   for (const img of images) {
     if (!img.naturalWidth) continue;
@@ -15,8 +64,16 @@ async function prepareImagesForExport(container) {
     const rect = img.getBoundingClientRect();
     const cw = rect.width;
     const ch = rect.height;
-    const nw = img.naturalWidth;
-    const nh = img.naturalHeight;
+
+    // Load a clean, same-origin copy via blob fetch
+    const result = await loadCleanImage(img.src);
+    if (!result) continue; // skip if fetch fails
+
+    const { img: cleanImg, objectUrl } = result;
+    objectUrls.push(objectUrl);
+
+    const nw = cleanImg.naturalWidth;
+    const nh = cleanImg.naturalHeight;
 
     // Calculate object-fit: cover crop
     const containerRatio = cw / ch;
@@ -47,13 +104,44 @@ async function prepareImagesForExport(container) {
     canvas.style.borderRadius = getComputedStyle(img).borderRadius;
 
     const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    ctx.drawImage(cleanImg, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
 
     // Swap img → canvas
     const parent = img.parentNode;
     parent.replaceChild(canvas, img);
 
     restoreFns.push(() => parent.replaceChild(img, canvas));
+  }
+
+  return () => {
+    restoreFns.forEach(fn => fn());
+    objectUrls.forEach(url => URL.revokeObjectURL(url));
+  };
+}
+
+/**
+ * Replace all <img> src attributes in a container with same-origin
+ * blob object URLs so html2canvas won't encounter CORS issues.
+ */
+async function replaceImgSrcsWithBlobs(container) {
+  const images = container.querySelectorAll('img');
+  const restoreFns = [];
+
+  for (const img of images) {
+    const originalSrc = img.src;
+    // Only process cross-origin URLs (skip data: and blob: URLs)
+    if (!originalSrc || originalSrc.startsWith('data:') || originalSrc.startsWith('blob:')) continue;
+
+    try {
+      const objectUrl = await fetchAsObjectUrl(originalSrc);
+      img.src = objectUrl;
+      restoreFns.push(() => {
+        URL.revokeObjectURL(objectUrl);
+        img.src = originalSrc;
+      });
+    } catch {
+      // If fetch fails, leave original src
+    }
   }
 
   return () => restoreFns.forEach(fn => fn());
@@ -65,6 +153,7 @@ export async function exportAsImage(format = 'png') {
 
   showLoading('กำลังส่งออก...');
   let restoreImages = null;
+  let restoreImgSrcs = null;
   let originalBg = '';
   const isCustomBg = page.classList.contains('has-bg');
 
@@ -77,13 +166,16 @@ export async function exportAsImage(format = 'png') {
     // Pre-process images to preserve aspect ratios
     restoreImages = await prepareImagesForExport(page);
 
+    // Replace any remaining <img> src with same-origin blob URLs
+    restoreImgSrcs = await replaceImgSrcsWithBlobs(page);
+
     // Dynamically import html2canvas
     const { default: html2canvas } = await import('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/+esm');
 
     const contentCanvas = await html2canvas(page, {
       scale: 3, // Ultra-high resolution (3x)
       useCORS: true,
-      allowTaint: true,
+      allowTaint: false,
       backgroundColor: isCustomBg ? null : '#ffffff',
       width: page.scrollWidth,
       height: page.scrollHeight,
@@ -97,46 +189,47 @@ export async function exportAsImage(format = 'png') {
       const urlMatch = originalBg.match(/url\(['"]?(.*?)['"]?\)/);
       if (urlMatch && urlMatch[1]) {
         const bgUrl = urlMatch[1];
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.src = bgUrl;
-        
-        try {
-          await new Promise((resolve, reject) => {
-            img.onload = resolve;
-            img.onerror = reject;
-          });
 
-          finalCanvas = document.createElement('canvas');
-          finalCanvas.width = contentCanvas.width;
-          finalCanvas.height = contentCanvas.height;
-          const ctx = finalCanvas.getContext('2d');
+        // Load background image via blob fetch (same-origin safe)
+        const result = await loadCleanImage(bgUrl);
+        if (result) {
+          const { img, objectUrl } = result;
 
-          // Draw background (cover)
-          const imgRatio = img.naturalWidth / img.naturalHeight;
-          const canvasRatio = finalCanvas.width / finalCanvas.height;
-          let sx, sy, sw, sh;
-          if (imgRatio > canvasRatio) {
-            sh = img.naturalHeight;
-            sw = img.naturalHeight * canvasRatio;
-            sx = (img.naturalWidth - sw) / 2;
-            sy = 0;
-          } else {
-            sw = img.naturalWidth;
-            sh = img.naturalWidth / canvasRatio;
-            sx = 0;
-            sy = (img.naturalHeight - sh) / 2;
+          try {
+            finalCanvas = document.createElement('canvas');
+            finalCanvas.width = contentCanvas.width;
+            finalCanvas.height = contentCanvas.height;
+            const ctx = finalCanvas.getContext('2d');
+
+            // Draw background (cover)
+            const imgRatio = img.naturalWidth / img.naturalHeight;
+            const canvasRatio = finalCanvas.width / finalCanvas.height;
+            let sx, sy, sw, sh;
+            if (imgRatio > canvasRatio) {
+              sh = img.naturalHeight;
+              sw = img.naturalHeight * canvasRatio;
+              sx = (img.naturalWidth - sw) / 2;
+              sy = 0;
+            } else {
+              sw = img.naturalWidth;
+              sh = img.naturalWidth / canvasRatio;
+              sx = 0;
+              sy = (img.naturalHeight - sh) / 2;
+            }
+            
+            // Use high quality image smoothing
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(img, sx, sy, sw, sh, 0, 0, finalCanvas.width, finalCanvas.height);
+            
+            // Draw content on top
+            ctx.drawImage(contentCanvas, 0, 0);
+          } catch (imgErr) {
+            console.error("Failed to composite background for export", imgErr);
+            finalCanvas = contentCanvas; // fallback
+          } finally {
+            URL.revokeObjectURL(objectUrl);
           }
-          
-          // Use high quality image smoothing
-          ctx.imageSmoothingEnabled = true;
-          ctx.imageSmoothingQuality = 'high';
-          ctx.drawImage(img, sx, sy, sw, sh, 0, 0, finalCanvas.width, finalCanvas.height);
-          
-          // Draw content on top
-          ctx.drawImage(contentCanvas, 0, 0);
-        } catch (imgErr) {
-          console.error("Failed to load background for export", imgErr);
         }
       }
     }
@@ -158,6 +251,7 @@ export async function exportAsImage(format = 'png') {
     console.error('Export error:', err);
     showToast('เกิดข้อผิดพลาดในการส่งออก', 'error');
   } finally {
+    if (restoreImgSrcs) restoreImgSrcs();
     if (restoreImages) restoreImages();
     if (isCustomBg) {
       page.style.backgroundImage = originalBg;
