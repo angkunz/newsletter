@@ -147,6 +147,25 @@ async function replaceImgSrcsWithBlobs(container) {
   return () => restoreFns.forEach(fn => fn());
 }
 
+/**
+ * Fetch Google Fonts CSS and embed it directly into the page as a <style> tag.
+ * This guarantees html2canvas can read the @font-face rules during cloning.
+ */
+async function embedFontsForExport() {
+  if (document.getElementById('nl-embedded-fonts')) return;
+  try {
+    const fontUrl = 'https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600;700;800&family=Sarabun:wght@300;400;500;600;700&display=swap';
+    const res = await fetch(fontUrl);
+    const css = await res.text();
+    const style = document.createElement('style');
+    style.id = 'nl-embedded-fonts';
+    style.innerHTML = css;
+    document.head.appendChild(style);
+  } catch (e) {
+    console.warn("Failed to embed fonts for export", e);
+  }
+}
+
 export async function exportAsImage(format = 'png') {
   const page = document.getElementById('nl-page');
   if (!page) return;
@@ -162,6 +181,9 @@ export async function exportAsImage(format = 'png') {
       originalBg = page.style.backgroundImage;
       page.style.backgroundImage = 'none'; // hide it from html2canvas
     }
+
+    // Embed fonts inline to guarantee html2canvas sees them
+    await embedFontsForExport();
 
     // Pre-process images to preserve aspect ratios
     restoreImages = await prepareImagesForExport(page);
@@ -183,13 +205,6 @@ export async function exportAsImage(format = 'png') {
       width: page.scrollWidth,
       height: page.scrollHeight,
       logging: false,
-      onclone: (clonedDoc) => {
-        // Explicitly force web fonts in cloned document
-        const link = clonedDoc.createElement('link');
-        link.rel = 'stylesheet';
-        link.href = 'https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600;700;800&family=Sarabun:wght@300;400;500;600;700&display=swap';
-        clonedDoc.head.appendChild(link);
-      }
     });
 
     let finalCanvas = contentCanvas;
